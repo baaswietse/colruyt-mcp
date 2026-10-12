@@ -79,17 +79,52 @@ Les deux sites se comportent très différemment, et l'outil les traite séparé
   `session_status` affiche la date d'expiration et prévient sous 7 jours restants.
 - **Collect&Go** (panier, enlèvement, créneau, frais de service) : la session serveur expire
   après environ une demi-heure d'inactivité. Quand un outil Collect&Go tombe sur une session
-  expirée, l'outil la renouvelle automatiquement : le navigateur du login s'ouvre réduit quelques
-  secondes et se reconnecte par l'authentification unique, **sans nouveau code SMS**, tant que
-  celle-ci est encore valide (cochez « rester connecté » au login pour qu'elle le soit). Au plus
-  une reconnexion toutes les 5 minutes.
+  expirée, l'outil la renouvelle automatiquement par l'authentification unique, **sans nouveau
+  code SMS**, tant que celle-ci est encore valide (cochez « rester connecté » au login pour
+  qu'elle le soit). La reconnexion se fait d'abord par de simples requêtes HTTP (sans
+  navigateur) ; seulement si cela échoue, le navigateur du login s'ouvre réduit quelques
+  secondes. Au plus une reconnexion automatique toutes les 5 minutes.
+- **Authentification unique** (Azure B2C, login.myxtra.be) : le cookie « rester connecté » dure
+  30 jours et n'est pas prolongé par l'usage. `session_status` affiche `sso_expires` et met
+  `login_needed` quand une nouvelle connexion manuelle (mot de passe + SMS) s'impose.
 
 Une session qui n'utilise que des outils Xtra n'ouvre donc jamais de navigateur. Définissez
 `COLRUYT_MCP_AUTO_REFRESH=0` pour désactiver la reconnexion automatique de Collect&Go ;
 l'assistant demande alors de lancer `refresh_session`. Celui-ci prend un `site`
-(`collect_and_go` par défaut, `colruyt`, ou `all`) et sert rarement. Si l'authentification unique
-a aussi expiré, le navigateur affiche le formulaire de connexion et il faut relancer
-`colruyt-mcp login`.
+(`collect_and_go` par défaut, `colruyt`, ou `all`) et une `method` (`auto`, `http`,
+`browser`) et sert rarement. Si l'authentification unique a expiré, il faut relancer
+`colruyt-mcp login` (la commande `refresh` accepte aussi `--method http` ou `--method browser`).
+
+Une seule machine doit renouveler la session Collect&Go : chaque reconnexion par
+l'authentification unique met fin à la session serveur précédente. Si le mode serveur ci-dessous
+est utilisé, désactivez la reconnexion automatique sur votre PC.
+
+## Mode serveur
+
+Le serveur peut tourner sur une machine sans écran (un NAS, un conteneur) et être joint en HTTP
+par un assistant qui tourne ailleurs. Les mêmes fichiers de cookies servent ; la connexion
+manuelle se fait dans un navigateur qui tourne en permanence sur cette machine et que vous voyez
+par un bureau web (par exemple l'image `linuxserver/chromium`, qui diffuse un vrai Chromium en
+HTTPS).
+
+- `COLRUYT_MCP_DEVTOOLS_PORT` : port DevTools local de ce navigateur (lancé avec
+  `--remote-debugging-port=<port> --remote-debugging-address=127.0.0.1 --user-data-dir=<profil>`).
+  `login` et `refresh` y ouvrent alors des onglets au lieu de lancer un navigateur ; rien n'est
+  attaché aux pages pendant leur chargement, les cookies sont lus une fois ensuite et les onglets
+  fermés.
+- `COLRUYT_MCP_LOGIN_URL` : l'adresse de ce bureau web. L'outil `request_login` ouvre les pages de
+  connexion et renvoie cette URL pour que l'assistant vous l'envoie ; une fois connecté (mot de
+  passe + SMS), l'assistant appelle `finish_login`, qui lit les cookies et vérifie les deux
+  sessions.
+- `colruyt-mcp serve --http [--host 0.0.0.0] [--port 8765]` : transport HTTP (streamable) sur le
+  chemin `/mcp`. Chaque requête doit porter `Authorization: Bearer <token>`, le token venant de
+  `COLRUYT_MCP_TOKEN` ou du fichier nommé par `COLRUYT_MCP_TOKEN_FILE`. À n'exposer que sur un
+  réseau privé ; le transport n'a pas de TLS.
+
+Les instructions du serveur (envoyées à `initialize`) demandent à l'assistant de surveiller
+`login_needed` et `sso_warning` dans `session_status`, d'appeler `request_login`, de vous envoyer
+l'URL, d'attendre votre confirmation puis d'appeler `finish_login`. Vos identifiants ne lui sont
+jamais demandés ni transmis.
 
 ## Brancher le MCP
 
@@ -117,7 +152,7 @@ Claude Desktop (`claude_desktop_config.json`). Sous Linux, mettez le chemin comp
 
 | Domaine | Outils |
 |---|---|
-| Session | `session_status`, `refresh_session` |
+| Session | `session_status`, `refresh_session`, `request_login`, `finish_login` (mode serveur) |
 | Catalogue | `search_products`, `get_products`, `get_purchase_history` (dernières courses, plus achetés, historique C&G) |
 | Recettes | `list_favorite_recipes`, `search_recipes`, `get_recipe`, `map_recipes_to_products` |
 | Liste Xtra | `get_xtra_list`, `add_to_xtra_list`, `update_xtra_list_item`, `remove_xtra_list_item` |

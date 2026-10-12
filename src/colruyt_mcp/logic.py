@@ -169,6 +169,15 @@ class Service:
         if days is not None and days < 7:
             out["colruyt_warning"] = (f"Le cookie colruyt.be expire dans {days} jour(s) : "
                                       "prévoyez `colruyt-mcp login`.")
+        sso_days = out["cookies"].get("sso_days_left")
+        out["login_needed"] = not out["cookies"]["sso_session"] or sso_days == 0
+        if out["login_needed"]:
+            out["login_note"] = ("La connexion unique (30 jours) est absente ou expirée : une nouvelle "
+                                 "connexion manuelle (mot de passe + SMS) est nécessaire. "
+                                 + ("Utilisez request_login." if config.LOGIN_URL else "Lancez `colruyt-mcp login`."))
+        elif sso_days is not None and sso_days < 5:
+            out["sso_warning"] = (f"La connexion unique expire dans {sso_days} jour(s) : prévoyez une "
+                                  "nouvelle connexion manuelle (mot de passe + SMS).")
         return out
 
     # -- history
@@ -353,9 +362,16 @@ class Service:
                        "service": cart.get("x_handoverServiceId"), "date": basket.get("handoverDate"),
                        "from": basket.get("handoverTimeFrom"), "to": basket.get("handoverTimeTo"),
                        "modifiable_until": f"{basket.get('aortDate')} {basket.get('aortTime')}"},
-            "totals": {"products": _num(cart.get("totalProductPrice")), "service_fee": _num(cart.get("x_totalServiceFee")),
+            # Observed on a real cart: x_grandTotal = totalProductPrice + totalAdjustment (promotions,
+            # negative); the service fee is added only once a pick-up slot is chosen. Line totals
+            # (x_totalProductsAmount) can differ slightly (deposits, rounding).
+            "totals": {"products_full_price": _num(cart.get("totalProductPrice")),
+                       "promotions_discount": _num(cart.get("totalAdjustment")),
+                       "products_after_promotions": _num(cart.get("x_grandTotal")),
+                       "service_fee": _num(cart.get("x_totalServiceFee")),
                        "service_fee_discount": _num(cart.get("x_totalServiceFeeDiscount")),
-                       "grand_total": _num(cart.get("x_grandTotal"))},
+                       "note": "products_after_promotions = produits moins promotions, hors frais de service "
+                               "(ajoutés quand un créneau est réservé). Montant définitif : sur collectandgo.be."},
             "lines": [{"order_item_id": i["orderItemId"], "name": (names.get(i["productId"]) or {}).get("name"),
                        "technical_article_number": (names.get(i["productId"]) or {}).get("x_techArticleId"),
                        "quantity": i.get("quantity"), "unit": i.get("unitType"), "step": i.get("step"),

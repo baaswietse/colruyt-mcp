@@ -1,4 +1,9 @@
-"""MCP server (stdio) exposing Colruyt Xtra / Collect&Go tools. Never places an order."""
+"""MCP server (stdio, or streamable HTTP with a bearer token) exposing Colruyt Xtra / Collect&Go
+tools. Never places an order."""
+import hmac
+import logging
+import os
+import sys
 from typing import Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -6,9 +11,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
+from . import browser, config
 from .client import ColruytClient, ColruytError
 from .logic import Service
-from .session import CookieStore
+from .session import CookieStore, http_refresh, open_login_tabs, silent_refresh
+
+log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 Outils Colruyt : catalogue, recettes (dont favoris), liste Xtra (colruyt.be) et panier Collect&Go.
@@ -28,6 +36,10 @@ Outils Colruyt : catalogue, recettes (dont favoris), liste Xtra (colruyt.be) et 
     Prévenez l'utilisateur que ça peut arriver.
   - Si une erreur de session persiste, demandez à l'utilisateur de lancer `colruyt-mcp login` dans
     un terminal (connexion manuelle + SMS). N'appelez pas refresh_session en boucle.
+  - La connexion unique (SSO) dure 30 jours. Quand session_status indique login_needed (ou
+    sso_warning), appelez request_login : il renvoie l'URL où l'utilisateur voit le navigateur du
+    serveur et se connecte (mot de passe + SMS). Envoyez-lui cette URL, attendez qu'il confirme,
+    puis appelez finish_login. Ne demandez jamais ses identifiants.
 """
 
 mcp = MCPServer("colruyt", instructions=INSTRUCTIONS)
@@ -71,21 +83,68 @@ class CartItem(BaseModel):
 # ------------------------------------------------------------------ session
 @mcp.tool(annotations=READ)
 async def session_status() -> dict:
-    """État des sessions colruyt.be et Collect&Go."""
+    """État des sessions colruyt.be et Collect&Go. Si login_needed est vrai (connexion unique de 30 jours
+    expirée) : appelez request_login, envoyez l'URL à l'utilisateur, attendez sa confirmation, puis
+    finish_login. Si sso_warning : prévenez l'utilisateur. Collect&Go se renouvelle seul sinon."""
     return await run(service().session_status())
 
 
+SITES = {"collect_and_go": ("cogo",), "colruyt": ("colruyt",), "all": ("colruyt", "cogo")}
+
+
 @mcp.tool(annotations=WRITE)
-async def refresh_session(site: Literal["collect_and_go", "colruyt", "all"] = "collect_and_go") -> dict:
-    """Reconnexion par le navigateur du login (SSO, sans SMS), qui s'ouvre réduit quelques secondes.
-    Rarement utile : Collect&Go se renouvelle déjà automatiquement, et le cookie colruyt.be dure ~60 jours."""
+async def refresh_session(site: Literal["collect_and_go", "colruyt", "all"] = "collect_and_go",
+                          method: Literal["auto", "http", "browser"] = "auto") -> dict:
+    """Reconnexion via la connexion unique (SSO, sans SMS) : par requêtes HTTP, sinon par le
+    navigateur. Rarement utile : Collect&Go se renouvelle déjà automatiquement, et le cookie
+    colruyt.be dure ~60 jours."""
     svc = service()
-    sites = {"collect_and_go": ("cogo",), "colruyt": ("colruyt",), "all": ("colruyt", "cogo")}[site]
+    sites = SITES[site]
     try:
-        result = await svc.c.refresh(sites)
+        if method == "auto":
+            result = await svc.c.refresh(sites)
+        else:
+            result = await svc.c.refresh_with(http_refresh if method == "http" else silent_refresh, sites)
     except Exception as exc:  # no browser, profile already in use, ...
         raise ToolError(f"Reconnexion impossible : {exc}") from exc
     return {"refresh": result, "status": await run(svc.session_status())}
+
+
+@mcp.tool(annotations=WRITE)
+async def request_login() -> dict:
+    """Connexion manuelle (mot de passe + SMS, par l'utilisateur lui-même, jamais par vous) : ouvre les
+    pages de connexion dans le navigateur du serveur et renvoie l'URL de ce navigateur. Envoyez l'URL à
+    l'utilisateur, attendez qu'il confirme, puis appelez finish_login. Ne demandez jamais ses identifiants."""
+    if browser.attached_port() is None:
+        raise ToolError("Pas de navigateur attaché à ce serveur : l'utilisateur doit lancer "
+                        "`colruyt-mcp login` sur la machine du serveur.")
+    if _state.get("login_tabs"):
+        port, tabs = _state["login_tabs"]
+        for t in tabs:
+            browser.close_tab(port, t)
+    try:
+        _state["login_tabs"] = open_login_tabs(("colruyt", "cogo"))
+    except Exception as exc:
+        raise ToolError(f"Impossible d'ouvrir les pages de connexion : {exc}") from exc
+    return {"url": config.LOGIN_URL,
+            "message": "Les pages de connexion colruyt.be et Collect&Go sont ouvertes dans le navigateur du "
+                       "serveur. Demandez à l'utilisateur de s'y connecter (cocher « rester connecté »), "
+                       "puis appelez finish_login."}
+
+
+@mcp.tool(annotations=WRITE)
+async def finish_login() -> dict:
+    """Après que l'utilisateur a confirmé sa connexion manuelle (voir request_login) : enregistre la
+    session depuis le navigateur du serveur, ferme les onglets de connexion et vérifie les deux sessions."""
+    if not _state.get("login_tabs"):
+        raise ToolError("Appelez d'abord request_login.")
+    port, tabs = _state.pop("login_tabs")
+    svc = service()
+    try:
+        result = await svc.c.collect_attached(port, tabs)
+    except Exception as exc:
+        raise ToolError(f"Lecture des cookies impossible : {exc}") from exc
+    return {"login": result, "status": await run(svc.session_status())}
 
 
 # ------------------------------------------------------------------ catalogue
@@ -145,7 +204,8 @@ async def get_xtra_list(include_completed: bool = False) -> dict:
 
 @mcp.tool(annotations=WRITE)
 async def add_to_xtra_list(items: list[ListItem]) -> dict:
-    """Ajoute des articles (produit ou texte libre) à la liste Xtra."""
+    """Ajoute des articles (produit ou texte libre) à la liste Xtra. Uniquement à la demande explicite de
+    l'utilisateur ; relisez get_xtra_list ensuite."""
     return await run(service().add_to_xtra_list([i.model_dump() for i in items]))
 
 
@@ -164,13 +224,15 @@ async def remove_xtra_list_item(item_id: str) -> dict:
 # ------------------------------------------------------------------ panier C&G
 @mcp.tool(annotations=READ)
 async def get_cart() -> dict:
-    """Panier Collect&Go : lignes, promos, frais de service, point et créneau d'enlèvement."""
+    """Panier Collect&Go : lignes, promos, point et créneau d'enlèvement, totaux (produits, promotions,
+    produits après promotions ; frais de service à part, ajoutés quand un créneau est réservé)."""
     return await run(service().cart())
 
 
 @mcp.tool(annotations=WRITE)
 async def add_to_cart(items: list[CartItem]) -> dict:
-    """Ajoute des produits au panier Collect&Go (ne valide pas la commande)."""
+    """Ajoute des produits au panier Collect&Go. Uniquement à la demande explicite de l'utilisateur ; ne
+    valide jamais la commande (c'est lui qui termine sur collectandgo.be) ; relisez get_cart ensuite."""
     return await run(service().add_to_cart([i.model_dump() for i in items]))
 
 
@@ -202,8 +264,8 @@ async def get_pickup_slots(days: int = 7) -> list[dict]:
 
 @mcp.tool(annotations=WRITE)
 async def reserve_pickup_slot(date: str, start: str) -> dict:
-    """Réserve un créneau (date AAAAMMJJ, start HHMM, tels que renvoyés par get_pickup_slots).
-    Ne valide pas la commande."""
+    """Réserve un créneau (date AAAAMMJJ, start HHMM, tels que renvoyés par get_pickup_slots), uniquement à
+    la demande explicite de l'utilisateur. Ne valide pas la commande."""
     return await run(service().reserve_pickup_slot(date, start))
 
 
@@ -227,5 +289,51 @@ async def service_fee_progress() -> dict:
     return await run(service().service_fee_progress())
 
 
-def main() -> None:
-    mcp.run("stdio")
+class TokenCheck:
+    """ASGI wrapper: every HTTP request must carry `Authorization: Bearer <token>`."""
+
+    def __init__(self, app, token: str):
+        self.app, self.token = app, token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            auth = next((v for k, v in scope.get("headers", []) if k == b"authorization"), b"").decode()
+            if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], self.token)):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain"), (b"www-authenticate", b"Bearer")]})
+                await send({"type": "http.response.body", "body": b"unauthorized"})
+                return
+        await self.app(scope, receive, send)
+
+
+def read_token() -> str | None:
+    token = os.environ.get("COLRUYT_MCP_TOKEN", "").strip()
+    path = os.environ.get("COLRUYT_MCP_TOKEN_FILE", "").strip()
+    if not token and path:
+        with open(path, encoding="utf-8") as f:
+            token = f.read().strip()
+    return token or None
+
+
+def main(transport: str = "stdio", host: str = "0.0.0.0", port: int = 8765) -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        stream=sys.stderr)
+    for noisy in ("httpx", "httpcore"):  # never log request URLs (they can carry tokens)
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    if transport == "stdio":
+        mcp.run("stdio")
+        return
+    token = read_token()
+    if not token:
+        sys.exit("COLRUYT_MCP_TOKEN (ou COLRUYT_MCP_TOKEN_FILE) est requis pour le transport HTTP.")
+    import uvicorn
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    log.info("colruyt-mcp HTTP sur %s:%s (chemin /mcp), navigateur attaché : %s", host, port,
+             browser.attached_port() or "non")
+    # The SDK's DNS-rebinding guard only accepts localhost Host headers; clients reach this server
+    # by container name on a private network, and the bearer token already blocks browsers.
+    app = mcp.streamable_http_app(
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+    uvicorn.run(TokenCheck(app, token), host=host, port=port, log_level="warning")

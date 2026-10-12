@@ -9,6 +9,14 @@ BROWSER_FILE = HOME / "browser.json"  # browser used at login + its real User-Ag
 LANG = os.environ.get("COLRUYT_MCP_LANG", "fr")
 COGO_LANG_ID = {"fr": "-2", "nl": "-1001"}
 
+# Server mode (e.g. in a container with a browser that is always running):
+# - COLRUYT_MCP_DEVTOOLS_PORT: local DevTools port of that browser; login/refresh open tabs in it
+#   instead of launching a browser ("attached" mode).
+# - COLRUYT_MCP_LOGIN_URL: where the user can see that browser (web desktop), returned by
+#   `request_login` so the assistant can send it to the user.
+# - COLRUYT_MCP_TOKEN or COLRUYT_MCP_TOKEN_FILE: bearer token of the HTTP transport (`serve --http`).
+LOGIN_URL = os.environ.get("COLRUYT_MCP_LOGIN_URL")
+
 # Fallback only: the client replays the User-Agent of the browser used at login (browser.json),
 # so that API calls look like the session's own browser.
 USER_AGENT = (

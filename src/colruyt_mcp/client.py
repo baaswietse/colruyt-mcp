@@ -16,7 +16,7 @@ import httpx
 
 from . import config
 from .browser import saved_user_agent
-from .session import CookieStore, silent_refresh
+from .session import CookieStore, auto_refresh, collect_from_attached
 
 log = logging.getLogger(__name__)
 
@@ -397,7 +397,7 @@ class ColruytClient:
     only when a Collect&Go call actually needs it."""
 
     def __init__(self, store: CookieStore | None = None, lang: str = config.LANG,
-                 auto_refresh: bool | None = None, refresher=silent_refresh):
+                 auto_refresh: bool | None = None, refresher=auto_refresh):
         self.store = store or CookieStore()
         self.http = httpx.AsyncClient(
             timeout=30, follow_redirects=False, cookies=self.store.to_jar(),
@@ -420,11 +420,22 @@ class ColruytClient:
         self.cogo.params = None
 
     async def refresh(self, sites: tuple[str, ...]) -> dict:
-        """Browser refresh of `sites` (blocking work runs in a thread), then reload the cookies."""
-        result = await asyncio.to_thread(self._refresher, self.store, sites)
+        """Refresh of `sites` with the default refresher (HTTP first, then browser; blocking work
+        runs in a thread), then reload the cookies."""
+        return await self.refresh_with(self._refresher, sites)
+
+    async def refresh_with(self, refresher, sites: tuple[str, ...]) -> dict:
+        result = await asyncio.to_thread(refresher, self.store, sites)
         self.reload_cookies()
         self._refresh_gen += 1
         self.last_refresh_result = result
+        return result
+
+    async def collect_attached(self, port: int, tabs: list[str]) -> dict:
+        """After a manual login in the attached browser: read its cookies, then reload them."""
+        result = await asyncio.to_thread(collect_from_attached, self.store, port, tabs)
+        self.reload_cookies()
+        self._refresh_gen += 1
         return result
 
     async def refresh_cogo(self) -> bool:
@@ -437,7 +448,7 @@ class ColruytClient:
             if time.monotonic() - self._last_refresh < REFRESH_COOLDOWN_S:
                 return False
             self._last_refresh = time.monotonic()
-            log.info("Session Collect&Go expirée : reconnexion via le navigateur")
+            log.info("Session Collect&Go expirée : reconnexion via la connexion unique")
             try:
                 result = await self.refresh(("cogo",))
             except Exception as exc:  # no browser, profile in use, ...

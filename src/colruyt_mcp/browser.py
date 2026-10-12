@@ -96,10 +96,36 @@ def saved_user_agent() -> str | None:
         return None
 
 
-def remember(browser: Browser, user_agent: str | None) -> None:
+def remember(browser: Browser | None, user_agent: str | None) -> None:
+    """`browser` is None in attached mode: only the User-Agent is worth remembering."""
     config.BROWSER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    config.BROWSER_FILE.write_text(json.dumps({"family": browser.family, "path": browser.path,
+    config.BROWSER_FILE.write_text(json.dumps({"family": browser.family if browser else "attached",
+                                               "path": browser.path if browser else None,
                                                "user_agent": user_agent}, indent=1), encoding="utf-8")
+
+
+# ------------------------------------------------------------------ attached browser
+
+def attached_port() -> int | None:
+    """DevTools port of a browser that is already running (server mode). Tabs are opened and
+    closed through the local DevTools HTTP endpoints; nothing is attached while pages load."""
+    raw = os.environ.get("COLRUYT_MCP_DEVTOOLS_PORT", "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def open_tab(port: int, url: str) -> str:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?{url}", method="PUT")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.load(r).get("id", "")
+
+
+def close_tab(port: int, tab_id: str) -> None:
+    if not tab_id:
+        return
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/close/{tab_id}", timeout=5).read()
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------------------ process & DevTools
@@ -169,8 +195,10 @@ def wait_for_tabs(port: int, targets: dict[str, tuple[str, str]], timeout_s: flo
         for name, (start, prefix) in targets.items():
             start_prefix = start.split("?")[0]
             ours[name] |= {tid for tid, url in current if url.startswith(start_prefix)}
-            landed[name] = landed[name] or any(tid in ours[name] and url.startswith(prefix)
-                                               for tid, url in current)
+            # the login URL itself may share the landing prefix (same site): it never counts as landed
+            landed[name] = landed[name] or any(
+                tid in ours[name] and url.startswith(prefix) and not url.startswith(start_prefix)
+                for tid, url in current)
         if all(landed.values()) or time.monotonic() > deadline:
             if all(landed.values()):
                 time.sleep(2)  # let the landing page finish setting its cookies

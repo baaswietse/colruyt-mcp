@@ -90,15 +90,49 @@ The two sites behave very differently, and the tool treats them separately.
   expiry and warns under 7 days left.
 - **Collect&Go** (cart, pick-up, slots, service fee): the server session expires after about
   half an hour of inactivity. When a Collect&Go tool hits an expired session, the tool renews it
-  automatically: the browser used at login opens minimised for a few seconds and reconnects
-  through single sign-on, **without a new SMS code**, as long as the single sign-on is still valid
-  (tick "stay signed in" at login so it is). At most one such refresh every 5 minutes.
+  automatically through the single sign-on, **without a new SMS code**, as long as the single
+  sign-on is still valid (tick "stay signed in" at login so it is). The renewal is first tried
+  with plain HTTP requests (no browser); only if that fails does the browser used at login open
+  minimised for a few seconds. At most one automatic refresh every 5 minutes.
+- **Single sign-on** (Azure B2C, login.myxtra.be): the "stay signed in" cookie lasts 30 days and
+  is not extended by use. `session_status` shows `sso_expires` and sets `login_needed` when a new
+  manual login (password + SMS) is due.
 
 So a session that only uses Xtra tools never opens a browser at all. Set
 `COLRUYT_MCP_AUTO_REFRESH=0` to disable the automatic Collect&Go refresh; the assistant then asks
 you to run `refresh_session` instead. `refresh_session` takes a `site` (`collect_and_go` by
-default, `colruyt`, or `all`); it is rarely needed. If single sign-on has also expired, the
-browser shows the login form and you run `colruyt-mcp login` again.
+default, `colruyt`, or `all`) and a `method` (`auto`, `http`, `browser`); it is rarely needed.
+If single sign-on has expired, you run `colruyt-mcp login` again (`--method http` and
+`--method browser` exist on the `refresh` command too).
+
+Only one machine should renew the Collect&Go session: each single sign-on reconnection ends the
+previous Collect&Go server session. If the server mode below is in use, disable the automatic
+refresh on your PC.
+
+## Server mode
+
+The server can run on a machine without a screen (a NAS, a container) and be reached over HTTP by
+an assistant running elsewhere. The same cookie files are used; the manual login happens in a
+browser that is always running on that machine and that you reach through a web desktop (for
+example the `linuxserver/chromium` image, which streams a real Chromium over HTTPS).
+
+- `COLRUYT_MCP_DEVTOOLS_PORT`: local DevTools port of that running browser (start it with
+  `--remote-debugging-port=<port> --remote-debugging-address=127.0.0.1 --user-data-dir=<profile>`).
+  `login` and `refresh` then open tabs in it instead of launching a browser; nothing is attached
+  to the pages while they load, cookies are read once afterwards and the tabs are closed.
+- `COLRUYT_MCP_LOGIN_URL`: the address of that web desktop. The tool `request_login` opens the
+  login pages and returns this URL so the assistant can send it to you; after you have logged in
+  (password + SMS), the assistant calls `finish_login`, which reads the cookies and checks both
+  sessions.
+- `colruyt-mcp serve --http [--host 0.0.0.0] [--port 8765]`: streamable HTTP transport on path
+  `/mcp`. Every request must carry `Authorization: Bearer <token>`, with the token from
+  `COLRUYT_MCP_TOKEN` or the file named by `COLRUYT_MCP_TOKEN_FILE`. Bind it to a private
+  network only; the transport itself has no TLS.
+
+The assistant's instructions (sent at `initialize`) tell it to watch `login_needed` and
+`sso_warning` in `session_status`, to call `request_login`, to send you the URL, to wait for
+your confirmation and then to call `finish_login`. It is never asked for, and never receives,
+your credentials.
 
 ## Connect it to Claude
 
@@ -125,7 +159,7 @@ claude mcp add colruyt -- uv run --directory C:\path\to\colruyt-mcp colruyt-mcp
 
 | Area | Tools |
 |---|---|
-| Session | `session_status`, `refresh_session` |
+| Session | `session_status`, `refresh_session`, `request_login`, `finish_login` (server mode) |
 | Catalogue | `search_products`, `get_products`, `get_purchase_history` (last ticket, most bought, Collect&Go history) |
 | Recipes | `list_favorite_recipes`, `search_recipes`, `get_recipe`, `map_recipes_to_products` |
 | Xtra list | `get_xtra_list`, `add_to_xtra_list`, `update_xtra_list_item`, `remove_xtra_list_item` |
