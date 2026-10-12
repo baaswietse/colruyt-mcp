@@ -26,13 +26,15 @@ log = logging.getLogger(__name__)
 
 COLRUYT_DOMAINS = ("colruyt.be", "collectandgo.be", "colruytgroup.com", "myxtra.be", "dcsecosystem.be")
 # Cookies replayed outside the browser: the two sites' sessions and the B2C single sign-on cookie
-# (login.myxtra.be, ~30 days, absolute) that `http_refresh` needs. In particular never send
-# `reese84`: the browser renews it every ~10 min; a stale one makes Imperva answer 405, while no
-# anti-bot cookie at all is accepted.
+# (login.myxtra.be, ~30 days, absolute) that `http_refresh` needs.
 SESSION_COOKIE = re.compile(
     r"^(clpbff_session|JSESSIONID|WC_.+|COL_.+|APP_C_LANGUAGE|colruytlanguage|cogo_user|x-ms-cpim-sso:.+)$")
 SSO_COOKIE = "x-ms-cpim-sso:"
-NEVER_REPLAY = {"reese84"}
+# Imperva anti-bot token. Since 2026-10-12 the Collect&Go API gateway (apip.collectandgo.be) answers
+# 405 "Colruyt | AntiBot" to any call without it, so API calls replay it. The browser renews it every
+# ~10 min; when the gateway rejects a stale one, `refresh_antibot` re-reads it from the attached
+# browser. The login chain (HTML pages) does not need it and never sends it.
+ANTIBOT_COOKIE = "reese84"
 
 
 def _ours(domain: str) -> bool:
@@ -60,13 +62,28 @@ class CookieStore:
             pass
 
     def to_jar(self, everything: bool = False) -> httpx.Cookies:
-        """Session cookies only (API calls), or everything but the anti-bot cookie (login chain)."""
+        """Session cookies plus the anti-bot token (API calls), or everything but the anti-bot token
+        (login chain)."""
         jar = httpx.Cookies()
         for c in self.load():
-            if c["name"] in NEVER_REPLAY or not (everything or SESSION_COOKIE.match(c["name"])):
+            if c["name"] == ANTIBOT_COOKIE:
+                if everything:
+                    continue
+            elif not (everything or SESSION_COOKIE.match(c["name"])):
                 continue
             jar.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
         return jar
+
+    def antibot_cookies(self) -> list[dict]:
+        return [c for c in self.load() if c["name"] == ANTIBOT_COOKIE]
+
+    def replace_antibot(self, cookies: list[dict]) -> int:
+        """Replace the stored anti-bot tokens by those of `cookies` (a fresh browser export). Returns
+        how many were stored."""
+        fresh = [c for c in cookies if c["name"] == ANTIBOT_COOKIE and _ours(c["domain"])]
+        if fresh:
+            self.save([c for c in self.load() if c["name"] != ANTIBOT_COOKIE] + fresh)
+        return len(fresh)
 
     def update_from_jar(self, jar: httpx.Cookies, everything: bool = False) -> None:
         """Merge cookies the servers rotated during API calls (or set during a login chain) back
@@ -74,7 +91,7 @@ class CookieStore:
         current = {(c["name"], c["domain"], c.get("path", "/")): c for c in self.load()}
         changed = False
         for ck in jar.jar:
-            if ck.name in NEVER_REPLAY or not (everything or SESSION_COOKIE.match(ck.name)):
+            if not (everything or SESSION_COOKIE.match(ck.name)):
                 continue
             if not _ours(ck.domain or ""):
                 continue
@@ -162,6 +179,15 @@ def collect_from_attached(store: CookieStore, port: int, tabs: list[str]) -> dic
         for t in tabs:
             browser.close_tab(port, t)
     return store.summary() | {"browser": "attached"}
+
+
+def refresh_antibot(store: CookieStore) -> int:
+    """Attached browser only: re-read the Imperva token(s) the browser keeps fresh on its open
+    collectandgo.be tab. Returns how many were stored (0 without an attached browser)."""
+    port = browser.attached_port()
+    if port is None:
+        return 0
+    return store.replace_antibot(browser.read_cookies_and_close(port, close=False))
 
 
 def interactive_login(store: CookieStore, preference: str | None = None) -> dict:

@@ -97,6 +97,11 @@ The two sites behave very differently, and the tool treats them separately.
 - **Single sign-on** (Azure B2C, login.myxtra.be): the "stay signed in" cookie lasts 30 days and
   is not extended by use. `session_status` shows `sso_expires` and sets `login_needed` when a new
   manual login (password + SMS) is due.
+- **Anti-bot token** (Imperva cookie `reese84`): since October 2026 the Collect&Go API gateway
+  answers HTTP 405 ("Colruyt | AntiBot") to any call without a valid token, even with a valid
+  session. The token saved at login is replayed with the API calls. When the gateway rejects it
+  (the browser renews it every ~10 minutes), the tool re-reads it from the attached browser
+  (server mode, see below) and retries once; without an attached browser, run `login` again.
 
 So a session that only uses Xtra tools never opens a browser at all. Set
 `COLRUYT_MCP_AUTO_REFRESH=0` to disable the automatic Collect&Go refresh; the assistant then asks

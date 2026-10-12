@@ -16,7 +16,7 @@ import httpx
 
 from . import config
 from .browser import saved_user_agent
-from .session import CookieStore, auto_refresh, collect_from_attached
+from .session import CookieStore, auto_refresh, collect_from_attached, refresh_antibot
 
 log = logging.getLogger(__name__)
 
@@ -223,8 +223,9 @@ class Cogo(_Base):
         self.lang = lang
         self.lang_id = config.COGO_LANG_ID[lang]
         self.params: dict | None = None
-        # Async callback returning True when it renewed the session (set by ColruytClient).
+        # Async callbacks (set by ColruytClient): True when they renewed the session / the anti-bot token.
         self.on_expired = None
+        self.on_blocked = None
 
     async def _load_params(self) -> dict:
         resp = await self.http.get(config.COGO_HOME)
@@ -262,6 +263,11 @@ class Cogo(_Base):
         except SessionExpired:
             await self.bootstrap(force=True)  # token may have rotated; one retry
             headers["WCAuthToken"] = self.params["WCAuthToken"]
+            resp = await self.request(method, url, "Collect&Go", headers=headers, json=body, params=params)
+        except BotBlocked:
+            # Imperva rejected the (missing or stale) anti-bot token: fetch a fresh one, one retry
+            if not (self.on_blocked and await self.on_blocked()):
+                raise
             resp = await self.request(method, url, "Collect&Go", headers=headers, json=body, params=params)
         return resp.json() if resp.content else None
 
@@ -389,6 +395,7 @@ class Cogo(_Base):
 
 
 REFRESH_COOLDOWN_S = 300  # at most one automatic browser refresh every 5 minutes
+ANTIBOT_COOLDOWN_S = 20  # at most one anti-bot token re-read from the browser every 20 seconds
 
 
 class ColruytClient:
@@ -412,12 +419,37 @@ class ColruytClient:
         self._refresh_gen = 0
         self._last_refresh = -REFRESH_COOLDOWN_S
         self.last_refresh_result: dict | None = None
+        self._antibot_lock = asyncio.Lock()
+        self._last_antibot = -ANTIBOT_COOLDOWN_S
         if auto_refresh:
             self.cogo.on_expired = self.refresh_cogo
+        self.cogo.on_blocked = self.refresh_antibot
 
     def reload_cookies(self) -> None:
         self.http.cookies = self.store.to_jar()
         self.cogo.params = None
+
+    def reload_antibot(self) -> None:
+        for c in self.store.antibot_cookies():
+            self.http.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
+
+    async def refresh_antibot(self) -> bool:
+        """Re-read the Imperva token from the attached browser (no-op without one). Concurrent
+        callers share one read; True when a fresh token was loaded."""
+        async with self._antibot_lock:
+            if time.monotonic() - self._last_antibot < ANTIBOT_COOLDOWN_S:
+                return True  # just refreshed for another caller: let it retry with that token
+            self._last_antibot = time.monotonic()
+            try:
+                stored = await asyncio.to_thread(refresh_antibot, self.store)
+            except Exception as exc:  # DevTools unreachable, ...
+                log.warning("Jeton anti-bot : relecture impossible : %s", exc)
+                return False
+            if not stored:
+                return False
+            log.info("Jeton anti-bot relu depuis le navigateur (%d cookie(s))", stored)
+            self.reload_antibot()
+            return True
 
     async def refresh(self, sites: tuple[str, ...]) -> dict:
         """Refresh of `sites` with the default refresher (HTTP first, then browser; blocking work

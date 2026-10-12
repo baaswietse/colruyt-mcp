@@ -135,13 +135,27 @@ def test_summary_reports_sso_expiry(tmp_path):
     assert s["colruyt_session"] is False and s["sso_expires"] is not None
 
 
-def test_jar_for_api_calls_excludes_sso_and_antibot(tmp_path):
+def test_jar_for_api_calls_has_antibot_login_chain_has_not(tmp_path):
     store = store_with(tmp_path, [
         cookie("x-ms-cpim-sso:t_0", ".login.myxtra.be"), cookie("reese84", ".colruyt.be"),
         cookie("clpbff_session", ".colruyt.be"), cookie("_fbp", ".colruyt.be"),
     ])
-    assert {c.name for c in store.to_jar().jar} == {"clpbff_session", "x-ms-cpim-sso:t_0"}
+    assert {c.name for c in store.to_jar().jar} == {"clpbff_session", "x-ms-cpim-sso:t_0", "reese84"}
     assert {c.name for c in store.to_jar(everything=True).jar} == {"clpbff_session", "x-ms-cpim-sso:t_0", "_fbp"}
+
+
+def test_replace_antibot_keeps_other_cookies(tmp_path):
+    store = store_with(tmp_path, [cookie("reese84", ".colruyt.be", "old"), cookie("JSESSIONID", ".collectandgo.be")])
+    assert store.replace_antibot([cookie("reese84", ".colruyt.be", "new"), cookie("reese84", ".collectandgo.be", "new2"),
+                                  cookie("reese84", ".example.com", "x"), cookie("_ga", ".colruyt.be")]) == 2
+    assert {(c["name"], c["value"]) for c in store.load()} == {("reese84", "new"), ("reese84", "new2"), ("JSESSIONID", "v")}
+    assert store.replace_antibot([cookie("_ga", ".colruyt.be")]) == 0
+    assert len(store.antibot_cookies()) == 2
+
+
+def test_refresh_antibot_without_attached_browser(tmp_path, monkeypatch):
+    monkeypatch.delenv("COLRUYT_MCP_DEVTOOLS_PORT", raising=False)
+    assert session.refresh_antibot(store_with(tmp_path, [])) == 0
 
 
 def test_wait_for_tabs_accepts_any_language_landing():

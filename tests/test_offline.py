@@ -3,7 +3,8 @@ import httpx
 import pytest
 import respx
 
-from colruyt_mcp.client import ClpBff, Cogo, ForbiddenOperation, SessionExpired, parse_clp_api_key, parse_wcparam
+from colruyt_mcp.client import (BotBlocked, ClpBff, Cogo, ColruytClient, ForbiddenOperation, SessionExpired,
+                                parse_clp_api_key, parse_wcparam)
 from colruyt_mcp.logic import order_item, orderable_units, summarize_promo
 from colruyt_mcp.session import CookieStore
 
@@ -88,7 +89,48 @@ def test_only_session_cookies_are_replayed(tmp_path):
         for n in ("JSESSIONID", "WC_AUTHENTICATION_1", "reese84", "_ga", "COL_SHOP")
     ] + [{"name": "clpbff_session", "value": "v", "domain": ".colruyt.be", "path": "/"}])
     assert sorted(c.name for c in store.to_jar().jar) == [
-        "COL_SHOP", "JSESSIONID", "WC_AUTHENTICATION_1", "clpbff_session"]
+        "COL_SHOP", "JSESSIONID", "WC_AUTHENTICATION_1", "clpbff_session", "reese84"]
+
+
+COGO_HOME = '<script>var WCParamJS = {"loggedIn": true, "WCAuthToken": \'t\', "apiGatewayKey": "k"};</script>'
+BASKET = ("https://apip.collectandgo.be/gateway/ecomfoodb2c.eshop.wcsbasketcontextsvcv2/v2/store/90004"
+          "/basketcontent/getbasketcontextdata")
+ANTIBOT = "<html><title>Colruyt | AntiBot</title></html>"
+
+
+@respx.mock
+async def test_405_antibot_refreshes_token_and_retries(tmp_path, monkeypatch):
+    """Imperva answers 405 to the stale token; the fresh one from the browser is replayed once."""
+    store = CookieStore(tmp_path / "c.json")
+    store.save([{"name": "reese84", "value": "stale", "domain": ".collectandgo.be", "path": "/"}])
+    monkeypatch.setattr("colruyt_mcp.client.refresh_antibot", lambda s: s.replace_antibot(
+        [{"name": "reese84", "value": "fresh", "domain": ".collectandgo.be", "path": "/"}]))
+    respx.get("https://www.collectandgo.be/fr/home").respond(200, text=COGO_HOME)
+    basket = respx.get(url__startswith=BASKET).mock(side_effect=lambda req: httpx.Response(
+        200, json={"basket": {}}) if "reese84=fresh" in req.headers.get("cookie", "")
+        else httpx.Response(405, text=ANTIBOT, headers={"content-type": "text/html; charset=UTF-8"}))
+    client = ColruytClient(store, auto_refresh=False)
+    try:
+        assert await client.cogo.basket() == {"basket": {}}
+        assert basket.call_count == 2
+        assert store.antibot_cookies()[0]["value"] == "fresh"
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_405_without_fresh_token_raises(tmp_path, monkeypatch):
+    store = CookieStore(tmp_path / "c.json")
+    monkeypatch.setattr("colruyt_mcp.client.refresh_antibot", lambda s: 0)  # no attached browser
+    respx.get("https://www.collectandgo.be/fr/home").respond(200, text=COGO_HOME)
+    basket = respx.get(url__startswith=BASKET).respond(405, text=ANTIBOT, headers={"content-type": "text/html"})
+    client = ColruytClient(store, auto_refresh=False)
+    try:
+        with pytest.raises(BotBlocked):
+            await client.cogo.basket()
+        assert basket.call_count == 1
+    finally:
+        await client.aclose()
 
 
 def test_xtra_list_entry_product_and_free_text():
